@@ -9,12 +9,8 @@
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; overflow: hidden; background: var(--bg); color: var(--ink);
     font: 14px/1.2 ui-monospace, "Cascadia Mono", Consolas, Menlo, monospace; }
-  #stage { position: fixed; left: 50%; top: 50%; transform-origin: 0 0; }
-  #stage > * { position: absolute; will-change: transform; user-select: none; pointer-events: none; }
-  #fx, #vig, #grain { position: fixed; pointer-events: none; }
-  #fx { inset: 0; width: 100%; height: 100%; mix-blend-mode: screen; }
-  #vig { inset: 0; background: radial-gradient(ellipse at center, transparent 45%, #000 125%); }
-  #grain { inset: -128px; mix-blend-mode: overlay; opacity: .05; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; }
+  #fx { pointer-events: none; }
   #deck { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); display: flex; align-items: center; gap: 4px;
     max-width: calc(100vw - 32px); padding: 6px; border: 2px solid #000; border-radius: 999px;
     background: var(--ink); color: #000; box-shadow: 4px 4px 0 #000; }
@@ -31,25 +27,8 @@
 </style>
 </head>
 <body>
-<div id="stage" role="img" aria-label="Graffiti lettering that reads MANU, surrounded by piano keys and game controllers"></div>
+<canvas id="gl" role="img" aria-label="Graffiti lettering that reads MANU, surrounded by piano keys, drums and game controllers"></canvas>
 <canvas id="fx" aria-hidden="true"></canvas>
-<svg width="0" height="0" style="position:absolute" aria-hidden="true">
-  <filter id="boil" x="-3%" y="-3%" width="106%" height="106%" color-interpolation-filters="sRGB">
-    <feTurbulence id="boilNoise" type="fractalNoise" baseFrequency="0.02" numOctaves="2"/>
-    <feDisplacementMap id="boilDisp" in="SourceGraphic" scale="5" xChannelSelector="R" yChannelSelector="G"/>
-  </filter>
-  <!-- water ripples: grey = no shift; each feImage is a ring of waves stretched outward from a click -->
-  <filter id="ripple" x="0" y="0" width="100%" height="100%" color-interpolation-filters="sRGB">
-    <feFlood flood-color="rgb(128,128,128)" result="flat"/>
-    <feImage id="rip0" x="-9" y="-9" width="1" height="1" preserveAspectRatio="none" result="r0"/>
-    <feImage id="rip1" x="-9" y="-9" width="1" height="1" preserveAspectRatio="none" result="r1"/>
-    <feImage id="rip2" x="-9" y="-9" width="1" height="1" preserveAspectRatio="none" result="r2"/>
-    <feMerge result="map"><feMergeNode in="flat"/><feMergeNode in="r0"/><feMergeNode in="r1"/><feMergeNode in="r2"/></feMerge>
-    <feDisplacementMap id="ripDisp" in="SourceGraphic" in2="map" scale="0" xChannelSelector="R" yChannelSelector="G"/>
-  </filter>
-</svg>
-<div id="vig"></div>
-<div id="grain"></div>
 
 <div id="deck">
   <button id="prev" aria-label="Previous track"><svg viewBox="0 0 16 16"><path d="M2 2h2v12H2zM14 2v12L5 8z"/></svg></button>
@@ -69,16 +48,6 @@
 // Songs shipped with the site: drop files into music/ and list them here.
 const TRACKS = ["music/test-beat.wav"];
 
-const $ = id => document.getElementById(id);
-const stage = $("stage"), audio = $("audio"), title = $("title"), fx = $("fx"), vig = $("vig"), grain = $("grain");
-// "reduce motion" system setting: gentle drift only, no shake or flash
-const still = matchMedia("(prefers-reduced-motion: reduce)").matches;
-const calm = still ? 0.2 : 1, punch = still ? 0 : 1;
-
-// ---- illustration ----
-document.documentElement.style.setProperty("--bg", ART.bg);
-stage.style.width = ART.w + "px";
-stage.style.height = ART.h + "px";
 // How each piece moves, chosen by its name in the PSD (folder name, or layer name for a loose layer).
 //   ribbon  a wave travels along it, driven by the mids      (the piano keyboard)
 //   rumble  buzzes with the bass like a controller's motor   (the game pads)
@@ -87,46 +56,177 @@ stage.style.height = ART.h + "px";
 //   glow    swells with the volume                           (the halo behind the letters)
 //   jelly   squash-and-stretch bounce, one EQ band each      (the letters, and anything not listed)
 const KIND = { piano: "ribbon", videojuegos: "rumble", "Layer 18": "drum", draft: "boil", shadow: "glow" };
-const PAD = 48; // headroom above and below a ribbon for its wave
+// Screen pixels drawn per artwork pixel, at most. 1 = as sharp as the artwork itself.
+// Lower it (0.75, 0.5) if a weak machine still struggles: fewer pixels, softer picture.
+const MAX_SHARP = 1;
 
-const n = ART.layers.length;
-const kinds = ART.layers.map(L => KIND[L.name] || "jelly");
-const els = ART.layers.map((L, i) => {
-  const kind = kinds[i], pad = kind === "ribbon" ? PAD : 0;
-  const im = new Image();
-  im.src = "layers/" + L.src; im.alt = "";
-  let el = im;
-  if (kind === "ribbon") { // a canvas, redrawn every frame in thin slices (drawRibbon)
-    el = document.createElement("canvas");
-    el.width = L.w; el.height = L.h + pad * 2; el.img = im; el.c = el.getContext("2d");
+const $ = id => document.getElementById(id);
+const cv = $("gl"), audio = $("audio"), title = $("title"), fx = $("fx");
+// "reduce motion" system setting: gentle drift only, no shake, flash or ripples
+const still = matchMedia("(prefers-reduced-motion: reduce)").matches;
+const calm = still ? 0.2 : 1, punch = still ? 0 : 1;
+
+// ---- drawing: everything goes through one WebGL canvas ----
+// Pass 1 draws the pieces (each bent in its own way) into an off-screen picture.
+// Pass 2 puts that picture on screen through the "water": ripples, vignette, grain, brightness.
+const gl = cv.getContext("webgl2", { alpha: false, antialias: false }) || cv.getContext("webgl", { alpha: false, antialias: false });
+if (!gl) title.textContent = "This browser can't draw the visuals (no WebGL)";
+const gl2 = gl && typeof WebGL2RenderingContext !== "undefined" && gl instanceof WebGL2RenderingContext;
+
+const VERT = `
+attribute vec2 a;
+uniform vec4 rect, mat, view;   // rect: x,y,w,h in artwork px (padded)   mat: 2x2   view: artwork px -> screen
+uniform vec2 origin, shift;
+varying vec2 uv;
+void main() {
+  uv = a;
+  vec2 q = rect.xy + a * rect.zw - origin;
+  vec2 p = origin + vec2(mat.x * q.x + mat.y * q.y, mat.z * q.x + mat.w * q.y) + shift;
+  gl_Position = vec4(p * view.xy + view.zw, 0., 1.);
+}`;
+const PIECE = `
+precision highp float;
+uniform sampler2D tex;
+uniform vec4 rect;
+uniform vec2 size;
+uniform float pad, amp, split, t, seed;
+uniform int kind;               // 1 ribbon, 2 boil, 0 plain
+varying vec2 uv;
+vec4 at(vec2 p) {               // p in piece px; nothing outside the piece
+  vec2 q = p / size;
+  return texture2D(tex, q) * step(0., q.x) * step(q.x, 1.) * step(0., q.y) * step(q.y, 1.);
+}
+float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+float noise(vec2 p) {
+  vec2 i = floor(p), f = fract(p); f = f * f * (3. - 2. * f);
+  return mix(mix(hash(i), hash(i + vec2(1, 0)), f.x), mix(hash(i + vec2(0, 1)), hash(i + 1.), f.x), f.y);
+}
+void main() {
+  vec2 p = uv * rect.zw - pad;
+  if (kind == 1) p.y -= sin(p.x * 0.011 - t * 0.005) * amp;
+  if (kind == 2) p += (vec2(noise(p * 0.02 + seed), noise(p * 0.02 + seed + 37.)) - .5) * amp;
+  vec4 c = at(p);
+  if (split > 0.) {             // red/cyan fringe, like a misprinted sticker
+    vec4 red = vec4(1., .16, .35, 1.) * at(p - vec2(split, 0.)).a * .75;
+    vec4 cyan = vec4(.24, .86, 1., 1.) * at(p + vec2(split, 0.)).a * .75;
+    c += (red + cyan * (1. - red.a)) * (1. - c.a);
   }
-  Object.assign(el.style, { left: L.x + "px", top: L.y - pad + "px", width: L.w + "px", height: L.h + pad * 2 + "px" });
-  if (kind === "drum" || kind === "jelly") el.style.transformOrigin = "50% 100%"; // they stand on their base
-  if (kind === "boil" && !still) el.style.filter = "url(#boil)";
-  stage.append(el);
-  return el;
-});
-function drawRibbon(cv, t, amp) {
-  const im = cv.img;
-  if (!im.complete || !im.naturalWidth) return;
-  cv.c.clearRect(0, 0, cv.width, cv.height);
-  for (let x = 0; x < cv.width; x += 4)
-    cv.c.drawImage(im, x, 0, 4, im.naturalHeight, x, PAD + Math.sin(x * 0.011 - t * 0.005) * amp, 4, im.naturalHeight);
+  gl_FragColor = c;
+}`;
+const WATER = `
+precision highp float;
+uniform sampler2D tex;
+uniform vec2 res;
+uniform vec3 rip[4];            // x, y in screen px, age 0..1 (1 = finished)
+uniform float px, bright, sat, vig, grain, t;
+varying vec2 uv;
+float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+void main() {
+  vec2 p = uv * res, bend = vec2(0.);
+  for (int i = 0; i < 4; i++) {
+    float age = rip[i].z;
+    if (age < 1.) {             // a ring of three crests running outward, fading as it goes
+      vec2 d = p - rip[i].xy;
+      float r = length(d) + .001;
+      float x = (r - (1. - (1. - age) * (1. - age)) * 1250. * px) / (110. * px);
+      bend += d / r * sin(x * 6.2832) * exp(-x * x * .9) * pow(1. - age, 1.5) * 30. * px;
+    }
+  }
+  vec3 c = texture2D(tex, (p + bend) / res).rgb;
+  c = mix(vec3(dot(c, vec3(.2126, .7152, .0722))), c, sat) * bright;
+  c *= 1. - clamp((length(uv - .5) * 1.4142 - .45) / .8, 0., 1.) * vig;
+  c += (hash(p + t) - .5) * grain;
+  gl_FragColor = vec4(c, 1.);
+}`;
+function program(fragment) {
+  const p = gl.createProgram();
+  for (const [type, src] of [[gl.VERTEX_SHADER, fragment === WATER ? "attribute vec2 a; varying vec2 uv; void main() { uv = a; gl_Position = vec4(a * 2. - 1., 0., 1.); }" : VERT], [gl.FRAGMENT_SHADER, fragment]]) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+    gl.attachShader(p, s);
+  }
+  gl.bindAttribLocation(p, 0, "a");
+  gl.linkProgram(p);
+  const u = {};
+  for (let i = 0; i < gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS); i++) {
+    const name = gl.getActiveUniform(p, i).name.replace("[0]", "");
+    u[name] = gl.getUniformLocation(p, name);
+  }
+  return { p, u };
+}
+function texture(source) {
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  if (source) {
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
+    if (gl2) { gl.generateMipmap(gl.TEXTURE_2D); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR); }
+  }
+  return tex;
 }
 
+const PAD = { ribbon: 48, boil: 16, jelly: 8 }; // room around a piece for its distortion to spill into
+const n = ART.layers.length;
+const pieces = ART.layers.map((L, i) => {
+  const kind = i ? KIND[L.name] || "jelly" : "backdrop";
+  const base = kind === "drum" || kind === "jelly"; // these stand on their base, the rest pivot on their centre
+  const piece = { ...L, kind, pad: PAD[kind] || 0, ox: L.x + L.w / 2, oy: L.y + (base ? L.h : L.h / 2), tex: null };
+  if (gl) {
+    const im = new Image();
+    im.onload = () => { piece.tex = texture(im); };
+    im.src = "layers/" + L.src;
+  }
+  return piece;
+});
+
+let pieceProg, waterProg, scene, sceneTex;
+if (gl) {
+  pieceProg = program(PIECE); waterProg = program(WATER);
+  gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0, 0, 1, 0, 0, 1, 1, 1]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+  sceneTex = texture();
+  scene = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, scene);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, sceneTex, 0);
+}
+const bg = [1, 3, 5].map(k => parseInt(ART.bg.slice(k, k + 2), 16) / 255);
+document.documentElement.style.setProperty("--bg", ART.bg);
+
 const g = fx.getContext("2d");
-let fitS = 1, dpr = 1;
+let fitS = 1, dpr = 1, sharp = 1;
 function fit() {
   // cover the window, but on tall screens keep at least 80% of the width in view
   const w = innerWidth / ART.w, h = innerHeight / ART.h;
   fitS = Math.max(w, Math.min(h, w / 0.8)) * 1.08; // 8% overscan hides layer edges while they move
   dpr = Math.min(2, devicePixelRatio || 1);
   fx.width = innerWidth * dpr; fx.height = innerHeight * dpr;
+  // never draw more pixels than the artwork has: that is the whole cost of a frame
+  sharp = Math.min(devicePixelRatio || 1, MAX_SHARP / fitS);
+  cv.width = Math.round(innerWidth * sharp); cv.height = Math.round(innerHeight * sharp);
+  if (gl) {
+    gl.bindTexture(gl.TEXTURE_2D, sceneTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, cv.width, cv.height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  }
 }
 addEventListener("resize", fit); fit();
 
 let mx = 0, my = 0, sx = 0, sy = 0;
 addEventListener("pointermove", e => { mx = e.clientX / innerWidth * 2 - 1; my = e.clientY / innerHeight * 2 - 1; });
+
+// water ripples on click: the artwork is seen through a sheet of water, nothing is drawn, the picture is only bent
+const RIP = [0, 1, 2, 3].map(() => ({ x: 0, y: 0, t0: -1e9 }));
+let ripNext = 0;
+addEventListener("pointerdown", e => {
+  if (still || e.target.closest("#deck")) return;
+  Object.assign(RIP[ripNext++ % RIP.length], { x: e.clientX, y: e.clientY, t0: performance.now() });
+});
 
 // ---- audio ----
 let ctx, analyser, bins, hz;
@@ -173,116 +273,88 @@ function drawParticles(dt, loud, treble) {
   }
 }
 
-// film grain tile
-{
-  const c = document.createElement("canvas"); c.width = c.height = 128;
-  const cg = c.getContext("2d"), id = cg.createImageData(128, 128);
-  for (let k = 0; k < id.data.length; k += 4) { id.data[k] = id.data[k + 1] = id.data[k + 2] = Math.random() * 255; id.data[k + 3] = 255; }
-  cg.putImageData(id, 0, 0);
-  grain.style.backgroundImage = `url(${c.toDataURL()})`;
-}
-
-// ---- water ripples on click ----
-// The artwork is seen through a sheet of water: nothing is drawn, the picture underneath is only bent.
-// ponytail: 3 ripples at once sharing one strength. More, or per-ripple fading, means one displacement pass each.
-const RIP = [0, 1, 2].map(k => ({ el: $("rip" + k), t0: -1e9, x: 0, y: 0 }));
-{
-  // one ring of waves as a displacement map: red = push left/right, green = push up/down, pointing away from the centre
-  const S = 256, c = document.createElement("canvas"); c.width = c.height = S;
-  const cg = c.getContext("2d"), id = cg.createImageData(S, S);
-  for (let y = 0, k = 0; y < S; y++) for (let x = 0; x < S; x++, k += 4) {
-    const dx = (x + 0.5) / S * 2 - 1, dy = (y + 0.5) / S * 2 - 1, r = Math.hypot(dx, dy);
-    if (r >= 1) continue;                      // transparent outside the ring
-    const wave = Math.sin(r * 6.283 * 3);      // three crests from centre to rim
-    id.data[k] = 128 + 127 * wave * dx / r; id.data[k + 1] = 128 + 127 * wave * dy / r; id.data[k + 2] = 128;
-    id.data[k + 3] = 255 * Math.sin(Math.PI * r) ** 2; // calm at the centre and at the rim
-  }
-  cg.putImageData(id, 0, 0);
-  const url = c.toDataURL();
-  for (const r of RIP) r.el.setAttribute("href", url);
-}
-let ripNext = 0, wet = false;
-addEventListener("pointerdown", e => {
-  if (still || e.target.closest("#deck")) return;
-  const r = RIP[ripNext++ % RIP.length];
-  r.t0 = performance.now(); wet = true;
-  r.x = (e.clientX - innerWidth / 2) / fitS + ART.w / 2;  // window -> artwork coordinates
-  r.y = (e.clientY - innerHeight / 2) / fitS + ART.h / 2;
-});
-function ripples(t) {
-  let strength = 0;
-  for (const r of RIP) {
-    const p = Math.max(0, (t - r.t0) / 1800);  // 0..1 over 1.8 s
-    const live = p < 1;
-    const size = live ? 40 + 2400 * (1 - (1 - p) ** 2) : 1; // spreads fast, then slows
-    r.el.setAttribute("x", live ? r.x - size / 2 : -9); r.el.setAttribute("y", live ? r.y - size / 2 : -9);
-    r.el.setAttribute("width", size); r.el.setAttribute("height", size);
-    if (live) strength = Math.max(strength, (1 - p) ** 1.5);
-  }
-  $("ripDisp").setAttribute("scale", strength * 80);
-  wet = strength > 0;
-}
-
 // ---- frame ----
-// ponytail: fx are CSS filters + a 2D canvas. True bloom / full-frame RGB split needs the layers drawn in WebGL.
-let last = 0, kick = 0, prevBass = 0, lastKick = 0, lastBoil = 0;
+const RAD = Math.PI / 180, rnd = () => Math.random() - 0.5;
+const rips = new Float32Array(12);
+let last = 0, kick = 0, prevBass = 0, lastKick = 0;
 function frame(t) {
+  requestAnimationFrame(frame);
   const dt = Math.min(3, (t - last) / 16.67); last = t; // 1 = one 60 fps frame
   sx += (mx - sx) * 0.06 * dt; sy += (my - sy) * 0.06 * dt;
   if (analyser) analyser.getByteFrequencyData(bins);
   const bass = level(40, 150), mids = level(250, 2000), treble = level(3000, 9000), loud = level(40, 6000);
 
   // kick = a sharp rise in the bass; decays over ~10 frames
-  if ((bass - prevBass) / dt > 0.08 && bass > 0.4 && t - lastKick > 160) {
-    kick = 1; lastKick = t;
-  }
+  if ((bass - prevBass) / dt > 0.08 && bass > 0.4 && t - lastKick > 160) { kick = 1; lastKick = t; }
   prevBass = bass; kick *= 0.88 ** dt;
 
-  // whole picture: zoom punch + shake on the kick, brighter and more saturated when loud
-  const sh = kick * 7 * punch;
-  stage.style.transform = `translate(${(Math.random() - 0.5) * sh}px,${(Math.random() - 0.5) * sh}px) scale(${fitS * (1 + kick * 0.018 * punch)}) translate(-50%,-50%)`;
-  if (wet) ripples(t);
-  stage.style.filter = (wet ? "url(#ripple) " : "") + (loud < 0.01 ? "" : `brightness(${1 + kick * 0.12 * punch}) saturate(${1 + loud * 0.6})`);
-  vig.style.opacity = 0.9 - kick * 0.4 * punch;
-  grain.style.opacity = 0.05 + treble * 0.3;
-  if (!still) grain.style.transform = `translate(${Math.random() * 128 | 0}px,${Math.random() * 128 | 0}px)`;
+  drawParticles(dt, loud, treble);
+  if (!gl) return;
 
-  if (!still && t - lastBoil > 110) { // new wobble ~9 times a second, like drawings shot on twos
-    lastBoil = t;
-    $("boilNoise").setAttribute("seed", (t | 0) % 997);
-    $("boilDisp").setAttribute("scale", 5 + loud * 16);
-  }
-  const rnd = () => Math.random() - 0.5;
-  for (let i = 1; i < n; i++) {      // layer 0 is the backdrop, it stays put
-    const d = i / (n - 1);           // depth: 0 far, 1 near
-    const el = els[i];
-    const x = -sx * d * 44 * calm;
-    const y = (-sy * d * 30 + Math.sin(t / 1400 + i * 1.7) * 5 * d) * calm;
-    let move = "";
-    switch (kinds[i]) {
-      case "ribbon": drawRibbon(el, t, Math.min(PAD - 4, 3 + mids * mids * 60) * calm); break;
+  // pass 1: the pieces, into the off-screen picture
+  gl.bindFramebuffer(gl.FRAMEBUFFER, scene);
+  gl.viewport(0, 0, cv.width, cv.height);
+  gl.clearColor(bg[0], bg[1], bg[2], 1); gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.enable(gl.BLEND);
+  gl.useProgram(pieceProg.p);
+  let u = pieceProg.u;
+  // whole picture: zoom punch + shake on the kick
+  const S = fitS * (1 + kick * 0.018 * punch), sh = kick * 7 * punch;
+  gl.uniform4f(u.view, 2 * S / innerWidth, -2 * S / innerHeight,
+    (-ART.w * S + rnd() * sh * 2) / innerWidth, (ART.h * S + rnd() * sh * 2) / innerHeight);
+  gl.uniform1f(u.t, t);
+  gl.uniform1f(u.seed, Math.floor(t / 110) % 100 * 7.13); // new wobble ~9 times a second, like drawings shot on twos
+  for (let i = 0; i < n; i++) {
+    const P = pieces[i];
+    if (!P.tex) continue;
+    const d = i / (n - 1);             // depth: 0 far (the backdrop, which stays put), 1 near
+    let x = -sx * d * 44 * calm, y = (-sy * d * 30 + Math.sin(t / 1400 + i * 1.7) * 5 * d) * calm;
+    let rot = 0, skew = 0, scx = 1, scy = 1, amp = 0, split = 0, kind = 0;
+    switch (P.kind) {
+      case "ribbon": kind = 1; amp = Math.min(P.pad - 4, 3 + mids * mids * 60) * calm; break;
+      case "boil": kind = 2; amp = still ? 0 : 5 + loud * 16; break;
       case "rumble": {
         const b = Math.max(0, bass - 0.35) ** 2 * 14 * punch;
-        move = `translate(${rnd() * b}px,${rnd() * b}px) rotate(${rnd() * b * 0.08}deg)`;
+        x += rnd() * b; y += rnd() * b; rot = rnd() * b * 0.08;
         break;
       }
-      case "drum":
-        move = `skewX(${Math.sin(t * 0.08) * kick * 2.5 * punch}deg) scale(${1 + kick * 0.05 * calm},${1 - kick * 0.09 * calm})`;
-        break;
-      case "boil": break; // all in the #boil filter
-      case "glow": move = `scale(${1 + loud * 0.06 * calm})`; break;
-      default: { // jelly
-        const e = energy(n - 1 - i); // front pieces get the bass
-        move = `translateY(${-e * d * 48 * calm}px) rotate(${Math.sin(t / 700 + i * 2.1) * e * d * 3 * calm}deg) scale(${1 - e * 0.05 * calm},${1 + e * 0.13 * calm})`;
-        const split = e * d * 7 * punch; // red/cyan fringe, like a misprinted sticker
-        el.style.filter = split > 0.4
-          ? `drop-shadow(${split}px 0 0 rgba(255,40,90,.75)) drop-shadow(${-split}px 0 0 rgba(60,220,255,.75))` : "";
+      case "drum": skew = Math.sin(t * 0.08) * kick * 2.5 * punch; scx = 1 + kick * 0.05 * calm; scy = 1 - kick * 0.09 * calm; break;
+      case "glow": scx = scy = 1 + loud * 0.06 * calm; break;
+      case "jelly": {
+        const e = energy(n - 1 - i);   // front pieces get the bass
+        y -= e * d * 48 * calm;
+        rot = Math.sin(t / 700 + i * 2.1) * e * d * 3 * calm;
+        scx = 1 - e * 0.05 * calm; scy = 1 + e * 0.13 * calm;
+        split = e * d * 7 * punch; if (split < 0.4) split = 0;
       }
     }
-    el.style.transform = `translate3d(${x}px,${y}px,0) ${move}`;
+    const co = Math.cos(rot * RAD), si = Math.sin(rot * RAD), tk = Math.tan(skew * RAD);
+    gl.uniform4f(u.mat, co * scx, (co * tk - si) * scy, si * scx, (si * tk + co) * scy); // rotate * skew * scale
+    gl.uniform2f(u.origin, P.ox, P.oy);
+    gl.uniform2f(u.shift, x, y);
+    gl.uniform4f(u.rect, P.x - P.pad, P.y - P.pad, P.w + P.pad * 2, P.h + P.pad * 2);
+    gl.uniform2f(u.size, P.w, P.h);
+    gl.uniform1f(u.pad, P.pad); gl.uniform1f(u.amp, amp); gl.uniform1f(u.split, split); gl.uniform1i(u.kind, kind);
+    gl.bindTexture(gl.TEXTURE_2D, P.tex);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   }
-  drawParticles(dt, loud, treble);
-  requestAnimationFrame(frame);
+
+  // pass 2: onto the screen, through the water
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.disable(gl.BLEND);
+  gl.useProgram(waterProg.p);
+  u = waterProg.u;
+  RIP.forEach((r, k) => rips.set([r.x * sharp, (innerHeight - r.y) * sharp, Math.min(1, (t - r.t0) / 1800)], k * 3));
+  gl.uniform3fv(u.rip, rips);
+  gl.uniform2f(u.res, cv.width, cv.height);
+  gl.uniform1f(u.px, fitS * sharp);
+  gl.uniform1f(u.bright, 1 + kick * 0.12 * punch);
+  gl.uniform1f(u.sat, 1 + loud * 0.6);
+  gl.uniform1f(u.vig, 0.9 - kick * 0.4 * punch);
+  gl.uniform1f(u.grain, 0.04 + treble * 0.2);
+  gl.uniform1f(u.t, still ? 0 : t % 1000 * 0.017);
+  gl.bindTexture(gl.TEXTURE_2D, sceneTex);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 }
 requestAnimationFrame(frame);
 
@@ -318,7 +390,7 @@ audio.onplay = audio.onpause = () => {
 addEventListener("dragover", e => { e.preventDefault(); document.body.classList.add("drop"); });
 addEventListener("dragleave", () => document.body.classList.remove("drop"));
 addEventListener("drop", e => { e.preventDefault(); document.body.classList.remove("drop"); addFiles(e.dataTransfer.files); });
-load(0);
+if (gl) load(0);
 </script>
 </body>
 </html>
