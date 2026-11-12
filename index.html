@@ -38,6 +38,15 @@
     <feTurbulence id="boilNoise" type="fractalNoise" baseFrequency="0.02" numOctaves="2"/>
     <feDisplacementMap id="boilDisp" in="SourceGraphic" scale="5" xChannelSelector="R" yChannelSelector="G"/>
   </filter>
+  <!-- water ripples: grey = no shift; each feImage is a ring of waves stretched outward from a click -->
+  <filter id="ripple" x="0" y="0" width="100%" height="100%" color-interpolation-filters="sRGB">
+    <feFlood flood-color="rgb(128,128,128)" result="flat"/>
+    <feImage id="rip0" x="-9" y="-9" width="1" height="1" preserveAspectRatio="none" result="r0"/>
+    <feImage id="rip1" x="-9" y="-9" width="1" height="1" preserveAspectRatio="none" result="r1"/>
+    <feImage id="rip2" x="-9" y="-9" width="1" height="1" preserveAspectRatio="none" result="r2"/>
+    <feMerge result="map"><feMergeNode in="flat"/><feMergeNode in="r0"/><feMergeNode in="r1"/><feMergeNode in="r2"/></feMerge>
+    <feDisplacementMap id="ripDisp" in="SourceGraphic" in2="map" scale="0" xChannelSelector="R" yChannelSelector="G"/>
+  </filter>
 </svg>
 <div id="vig"></div>
 <div id="grain"></div>
@@ -173,6 +182,47 @@ function drawParticles(dt, loud, treble) {
   grain.style.backgroundImage = `url(${c.toDataURL()})`;
 }
 
+// ---- water ripples on click ----
+// The artwork is seen through a sheet of water: nothing is drawn, the picture underneath is only bent.
+// ponytail: 3 ripples at once sharing one strength. More, or per-ripple fading, means one displacement pass each.
+const RIP = [0, 1, 2].map(k => ({ el: $("rip" + k), t0: -1e9, x: 0, y: 0 }));
+{
+  // one ring of waves as a displacement map: red = push left/right, green = push up/down, pointing away from the centre
+  const S = 256, c = document.createElement("canvas"); c.width = c.height = S;
+  const cg = c.getContext("2d"), id = cg.createImageData(S, S);
+  for (let y = 0, k = 0; y < S; y++) for (let x = 0; x < S; x++, k += 4) {
+    const dx = (x + 0.5) / S * 2 - 1, dy = (y + 0.5) / S * 2 - 1, r = Math.hypot(dx, dy);
+    if (r >= 1) continue;                      // transparent outside the ring
+    const wave = Math.sin(r * 6.283 * 3);      // three crests from centre to rim
+    id.data[k] = 128 + 127 * wave * dx / r; id.data[k + 1] = 128 + 127 * wave * dy / r; id.data[k + 2] = 128;
+    id.data[k + 3] = 255 * Math.sin(Math.PI * r) ** 2; // calm at the centre and at the rim
+  }
+  cg.putImageData(id, 0, 0);
+  const url = c.toDataURL();
+  for (const r of RIP) r.el.setAttribute("href", url);
+}
+let ripNext = 0, wet = false;
+addEventListener("pointerdown", e => {
+  if (still || e.target.closest("#deck")) return;
+  const r = RIP[ripNext++ % RIP.length];
+  r.t0 = performance.now(); wet = true;
+  r.x = (e.clientX - innerWidth / 2) / fitS + ART.w / 2;  // window -> artwork coordinates
+  r.y = (e.clientY - innerHeight / 2) / fitS + ART.h / 2;
+});
+function ripples(t) {
+  let strength = 0;
+  for (const r of RIP) {
+    const p = Math.max(0, (t - r.t0) / 1800);  // 0..1 over 1.8 s
+    const live = p < 1;
+    const size = live ? 40 + 2400 * (1 - (1 - p) ** 2) : 1; // spreads fast, then slows
+    r.el.setAttribute("x", live ? r.x - size / 2 : -9); r.el.setAttribute("y", live ? r.y - size / 2 : -9);
+    r.el.setAttribute("width", size); r.el.setAttribute("height", size);
+    if (live) strength = Math.max(strength, (1 - p) ** 1.5);
+  }
+  $("ripDisp").setAttribute("scale", strength * 80);
+  wet = strength > 0;
+}
+
 // ---- frame ----
 // ponytail: fx are CSS filters + a 2D canvas. True bloom / full-frame RGB split needs the layers drawn in WebGL.
 let last = 0, kick = 0, prevBass = 0, lastKick = 0, lastBoil = 0;
@@ -191,7 +241,8 @@ function frame(t) {
   // whole picture: zoom punch + shake on the kick, brighter and more saturated when loud
   const sh = kick * 7 * punch;
   stage.style.transform = `translate(${(Math.random() - 0.5) * sh}px,${(Math.random() - 0.5) * sh}px) scale(${fitS * (1 + kick * 0.018 * punch)}) translate(-50%,-50%)`;
-  stage.style.filter = loud < 0.01 ? "" : `brightness(${1 + kick * 0.12 * punch}) saturate(${1 + loud * 0.6})`;
+  if (wet) ripples(t);
+  stage.style.filter = (wet ? "url(#ripple) " : "") + (loud < 0.01 ? "" : `brightness(${1 + kick * 0.12 * punch}) saturate(${1 + loud * 0.6})`);
   vig.style.opacity = 0.9 - kick * 0.4 * punch;
   grain.style.opacity = 0.05 + treble * 0.3;
   if (!still) grain.style.transform = `translate(${Math.random() * 128 | 0}px,${Math.random() * 128 | 0}px)`;
