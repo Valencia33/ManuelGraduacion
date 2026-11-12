@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Manu</title>
+<style>
+  :root { --bg: #140f0d; --ink: #f4f1ea; --cyan: #5fd6ff; --blue: #4638e8; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; overflow: hidden; background: var(--bg); color: var(--ink);
+    font: 14px/1.2 ui-monospace, "Cascadia Mono", Consolas, Menlo, monospace; }
+  #stage { position: fixed; left: 50%; top: 50%; transform-origin: 0 0; }
+  #stage > * { position: absolute; will-change: transform; user-select: none; pointer-events: none; }
+  #fx, #vig, #grain { position: fixed; pointer-events: none; }
+  #fx { inset: 0; width: 100%; height: 100%; mix-blend-mode: screen; }
+  #vig { inset: 0; background: radial-gradient(ellipse at center, transparent 45%, #000 125%); }
+  #grain { inset: -128px; mix-blend-mode: overlay; opacity: .05; }
+  #deck { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); display: flex; align-items: center; gap: 4px;
+    max-width: calc(100vw - 32px); padding: 6px; border: 2px solid #000; border-radius: 999px;
+    background: var(--ink); color: #000; box-shadow: 4px 4px 0 #000; }
+  #deck button, #deck label { display: grid; place-items: center; width: 36px; height: 36px; flex: none; border: 0; border-radius: 50%;
+    background: none; color: inherit; cursor: pointer; }
+  #deck button:hover, #deck label:hover { background: var(--cyan); }
+  #deck :focus-visible, #deck label:focus-within { outline: 3px solid var(--blue); outline-offset: 1px; }
+  #deck #play { background: var(--blue); color: #fff; }
+  #deck #play:hover { background: #000; }
+  #deck svg { width: 16px; height: 16px; fill: currentColor; }
+  #title { min-width: 0; padding: 0 12px 0 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 700; }
+  #deck input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+  body.drop #deck { background: var(--cyan); }
+</style>
+</head>
+<body>
+<div id="stage" role="img" aria-label="Graffiti lettering that reads MANU, surrounded by piano keys and game controllers"></div>
+<canvas id="fx" aria-hidden="true"></canvas>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <filter id="boil" x="-3%" y="-3%" width="106%" height="106%" color-interpolation-filters="sRGB">
+    <feTurbulence id="boilNoise" type="fractalNoise" baseFrequency="0.02" numOctaves="2"/>
+    <feDisplacementMap id="boilDisp" in="SourceGraphic" scale="5" xChannelSelector="R" yChannelSelector="G"/>
+  </filter>
+</svg>
+<div id="vig"></div>
+<div id="grain"></div>
+
+<div id="deck">
+  <button id="prev" aria-label="Previous track"><svg viewBox="0 0 16 16"><path d="M2 2h2v12H2zM14 2v12L5 8z"/></svg></button>
+  <button id="play" aria-label="Play"><svg viewBox="0 0 16 16"><path id="playIcon" d="M4 2l10 6-10 6z"/></svg></button>
+  <button id="next" aria-label="Next track"><svg viewBox="0 0 16 16"><path d="M12 2h2v12h-2zM2 2v12l9-6z"/></svg></button>
+  <span id="title" aria-live="polite"></span>
+  <label aria-label="Add music files" title="Add music files (or drop them anywhere)">
+    <svg viewBox="0 0 16 16"><path d="M7 2h2v5h5v2H9v5H7V9H2V7h5z"/></svg>
+    <input id="files" type="file" accept="audio/*" multiple>
+  </label>
+</div>
+
+<audio id="audio" preload="metadata"></audio>
+
+<script src="layers/layers.js"></script>
+<script>
+// Songs shipped with the site: drop files into music/ and list them here.
+const TRACKS = ["music/test-beat.wav"];
+
+const $ = id => document.getElementById(id);
+const stage = $("stage"), audio = $("audio"), title = $("title"), fx = $("fx"), vig = $("vig"), grain = $("grain");
+// "reduce motion" system setting: gentle drift only, no shake or flash
+const still = matchMedia("(prefers-reduced-motion: reduce)").matches;
+const calm = still ? 0.2 : 1, punch = still ? 0 : 1;
+
+// ---- illustration ----
+document.documentElement.style.setProperty("--bg", ART.bg);
+stage.style.width = ART.w + "px";
+stage.style.height = ART.h + "px";
+// How each piece moves, chosen by its name in the PSD (folder name, or layer name for a loose layer).
+//   ribbon  a wave travels along it, driven by the mids      (the piano keyboard)
+//   rumble  buzzes with the bass like a controller's motor   (the game pads)
+//   drum    squashes and rings on every kick
+//   boil    the lines wobble like a rough pencil animation   (the sketch)
+//   glow    swells with the volume                           (the halo behind the letters)
+//   jelly   squash-and-stretch bounce, one EQ band each      (the letters, and anything not listed)
+const KIND = { piano: "ribbon", videojuegos: "rumble", "Layer 18": "drum", draft: "boil", shadow: "glow" };
+const PAD = 48; // headroom above and below a ribbon for its wave
+
+const n = ART.layers.length;
+const kinds = ART.layers.map(L => KIND[L.name] || "jelly");
+const els = ART.layers.map((L, i) => {
+  const kind = kinds[i], pad = kind === "ribbon" ? PAD : 0;
+  const im = new Image();
+  im.src = "layers/" + L.src; im.alt = "";
+  let el = im;
+  if (kind === "ribbon") { // a canvas, redrawn every frame in thin slices (drawRibbon)
+    el = document.createElement("canvas");
+    el.width = L.w; el.height = L.h + pad * 2; el.img = im; el.c = el.getContext("2d");
+  }
+  Object.assign(el.style, { left: L.x + "px", top: L.y - pad + "px", width: L.w + "px", height: L.h + pad * 2 + "px" });
+  if (kind === "drum" || kind === "jelly") el.style.transformOrigin = "50% 100%"; // they stand on their base
+  if (kind === "boil" && !still) el.style.filter = "url(#boil)";
+  stage.append(el);
+  return el;
+});
+function drawRibbon(cv, t, amp) {
+  const im = cv.img;
+  if (!im.complete || !im.naturalWidth) return;
+  cv.c.clearRect(0, 0, cv.width, cv.height);
+  for (let x = 0; x < cv.width; x += 4)
+    cv.c.drawImage(im, x, 0, 4, im.naturalHeight, x, PAD + Math.sin(x * 0.011 - t * 0.005) * amp, 4, im.naturalHeight);
+}
+
+const g = fx.getContext("2d");
+let fitS = 1, dpr = 1;
+function fit() {
+  // cover the window, but on tall screens keep at least 80% of the width in view
+  const w = innerWidth / ART.w, h = innerHeight / ART.h;
+  fitS = Math.max(w, Math.min(h, w / 0.8)) * 1.08; // 8% overscan hides layer edges while they move
+  dpr = Math.min(2, devicePixelRatio || 1);
+  fx.width = innerWidth * dpr; fx.height = innerHeight * dpr;
+}
+addEventListener("resize", fit); fit();
+
+let mx = 0, my = 0, sx = 0, sy = 0;
+addEventListener("pointermove", e => { mx = e.clientX / innerWidth * 2 - 1; my = e.clientY / innerHeight * 2 - 1; });
+
+// ---- audio ----
+let ctx, analyser, bins, hz;
+function wire() {
+  if (ctx) return ctx.resume();
+  ctx = new AudioContext();
+  analyser = ctx.createAnalyser();
+  analyser.fftSize = 2048; analyser.smoothingTimeConstant = 0.72;
+  ctx.createMediaElementSource(audio).connect(analyser).connect(ctx.destination);
+  bins = new Uint8Array(analyser.frequencyBinCount);
+  hz = ctx.sampleRate / analyser.fftSize;
+}
+function level(lo, hi) { // average loudness between two frequencies, 0..1
+  if (!bins) return 0;
+  const a = Math.round(lo / hz), b = Math.max(a + 1, Math.round(hi / hz));
+  let sum = 0;
+  for (let k = a; k < b; k++) sum += bins[k];
+  return sum / (b - a) / 255;
+}
+// one band per moving layer, log-spaced 40 Hz - 6 kHz
+const cut = j => 40 * 150 ** (j / (n - 1));
+// squared for punch; highs are quieter than lows in real music, so tilt them up
+const energy = band => Math.min(1, level(cut(band), cut(band + 1)) ** 2 * (1 + 1.5 * band / (n - 1)));
+
+// ---- particles: quiet ambient dust ----
+const COLORS = ["#5fd6ff", "#6a5cff", "#ffe066", "#f4f1ea"];
+const parts = [];
+function drawParticles(dt, loud, treble) {
+  if (parts.length < 90 && Math.random() < (0.05 + loud * 0.3) * dt)
+    parts.push({ x: Math.random() * innerWidth, y: Math.random() * innerHeight, vx: (Math.random() - 0.5) * 0.3,
+      vy: -0.1 - Math.random() * 0.3, r: 0.6 + Math.random() * 1.6, life: 0, age: 0.002 + Math.random() * 0.003,
+      c: COLORS[Math.random() * COLORS.length | 0] });
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, innerWidth, innerHeight);
+  for (let k = parts.length - 1; k >= 0; k--) {
+    const p = parts[k];
+    const v = dt * calm * (1 + loud * 1.5); // drifts a little faster when the music is loud
+    p.x += p.vx * v; p.y += p.vy * v;
+    p.life += p.age * dt;
+    if (p.life >= 1) { parts[k] = parts[parts.length - 1]; parts.pop(); continue; }
+    g.globalAlpha = Math.sin(p.life * Math.PI) * (0.3 + treble * 0.4); // fade in and out, twinkle with the highs
+    g.fillStyle = p.c;
+    g.beginPath(); g.arc(p.x - sx * p.r * 6, p.y - sy * p.r * 4, p.r * (1 + treble * 0.6), 0, 6.283); g.fill();
+  }
+}
+
+// film grain tile
+{
+  const c = document.createElement("canvas"); c.width = c.height = 128;
+  const cg = c.getContext("2d"), id = cg.createImageData(128, 128);
+  for (let k = 0; k < id.data.length; k += 4) { id.data[k] = id.data[k + 1] = id.data[k + 2] = Math.random() * 255; id.data[k + 3] = 255; }
+  cg.putImageData(id, 0, 0);
+  grain.style.backgroundImage = `url(${c.toDataURL()})`;
+}
+
+// ---- frame ----
+// ponytail: fx are CSS filters + a 2D canvas. True bloom / full-frame RGB split needs the layers drawn in WebGL.
+let last = 0, kick = 0, prevBass = 0, lastKick = 0, lastBoil = 0;
+function frame(t) {
+  const dt = Math.min(3, (t - last) / 16.67); last = t; // 1 = one 60 fps frame
+  sx += (mx - sx) * 0.06 * dt; sy += (my - sy) * 0.06 * dt;
+  if (analyser) analyser.getByteFrequencyData(bins);
+  const bass = level(40, 150), mids = level(250, 2000), treble = level(3000, 9000), loud = level(40, 6000);
+
+  // kick = a sharp rise in the bass; decays over ~10 frames
+  if ((bass - prevBass) / dt > 0.08 && bass > 0.4 && t - lastKick > 160) {
+    kick = 1; lastKick = t;
+  }
+  prevBass = bass; kick *= 0.88 ** dt;
+
+  // whole picture: zoom punch + shake on the kick, brighter and more saturated when loud
+  const sh = kick * 7 * punch;
+  stage.style.transform = `translate(${(Math.random() - 0.5) * sh}px,${(Math.random() - 0.5) * sh}px) scale(${fitS * (1 + kick * 0.018 * punch)}) translate(-50%,-50%)`;
+  stage.style.filter = loud < 0.01 ? "" : `brightness(${1 + kick * 0.12 * punch}) saturate(${1 + loud * 0.6})`;
+  vig.style.opacity = 0.9 - kick * 0.4 * punch;
+  grain.style.opacity = 0.05 + treble * 0.3;
+  if (!still) grain.style.transform = `translate(${Math.random() * 128 | 0}px,${Math.random() * 128 | 0}px)`;
+
+  if (!still && t - lastBoil > 110) { // new wobble ~9 times a second, like drawings shot on twos
+    lastBoil = t;
+    $("boilNoise").setAttribute("seed", (t | 0) % 997);
+    $("boilDisp").setAttribute("scale", 5 + loud * 16);
+  }
+  const rnd = () => Math.random() - 0.5;
+  for (let i = 1; i < n; i++) {      // layer 0 is the backdrop, it stays put
+    const d = i / (n - 1);           // depth: 0 far, 1 near
+    const el = els[i];
+    const x = -sx * d * 44 * calm;
+    const y = (-sy * d * 30 + Math.sin(t / 1400 + i * 1.7) * 5 * d) * calm;
+    let move = "";
+    switch (kinds[i]) {
+      case "ribbon": drawRibbon(el, t, Math.min(PAD - 4, 3 + mids * mids * 60) * calm); break;
+      case "rumble": {
+        const b = Math.max(0, bass - 0.35) ** 2 * 14 * punch;
+        move = `translate(${rnd() * b}px,${rnd() * b}px) rotate(${rnd() * b * 0.08}deg)`;
+        break;
+      }
+      case "drum":
+        move = `skewX(${Math.sin(t * 0.08) * kick * 2.5 * punch}deg) scale(${1 + kick * 0.05 * calm},${1 - kick * 0.09 * calm})`;
+        break;
+      case "boil": break; // all in the #boil filter
+      case "glow": move = `scale(${1 + loud * 0.06 * calm})`; break;
+      default: { // jelly
+        const e = energy(n - 1 - i); // front pieces get the bass
+        move = `translateY(${-e * d * 48 * calm}px) rotate(${Math.sin(t / 700 + i * 2.1) * e * d * 3 * calm}deg) scale(${1 - e * 0.05 * calm},${1 + e * 0.13 * calm})`;
+        const split = e * d * 7 * punch; // red/cyan fringe, like a misprinted sticker
+        el.style.filter = split > 0.4
+          ? `drop-shadow(${split}px 0 0 rgba(255,40,90,.75)) drop-shadow(${-split}px 0 0 rgba(60,220,255,.75))` : "";
+      }
+    }
+    el.style.transform = `translate3d(${x}px,${y}px,0) ${move}`;
+  }
+  drawParticles(dt, loud, treble);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// ---- player ----
+const nameOf = s => decodeURIComponent(s.split("/").pop()).replace(/\.\w+$/, "");
+const list = TRACKS.map(src => ({ src, name: nameOf(src) }));
+let cur = 0;
+function load(i, play) {
+  if (!list.length) { title.textContent = "Drop an mp3 here"; return; }
+  cur = (i + list.length) % list.length;
+  audio.src = list[cur].src;
+  title.textContent = list[cur].name;
+  if (play) start();
+}
+function start() { wire(); audio.play().catch(() => {}); }
+function addFiles(files) {
+  const songs = [...files].filter(f => f.type.startsWith("audio/"));
+  if (!songs.length) return;
+  const first = list.length;
+  for (const f of songs) list.push({ src: URL.createObjectURL(f), name: f.name.replace(/\.\w+$/, "") });
+  load(first, true);
+}
+$("play").onclick = () => !list.length ? $("files").click() : audio.paused ? start() : audio.pause();
+$("prev").onclick = () => load(cur - 1, true);
+$("next").onclick = () => load(cur + 1, true);
+$("files").onchange = e => { addFiles(e.target.files); e.target.value = ""; };
+audio.onended = () => load(cur + 1, true);
+audio.onerror = () => { if (list.length) title.textContent = "Can't play " + list[cur].name; };
+audio.onplay = audio.onpause = () => {
+  $("playIcon").setAttribute("d", audio.paused ? "M4 2l10 6-10 6z" : "M3 2h4v12H3zM9 2h4v12H9z");
+  $("play").setAttribute("aria-label", audio.paused ? "Play" : "Pause");
+};
+addEventListener("dragover", e => { e.preventDefault(); document.body.classList.add("drop"); });
+addEventListener("dragleave", () => document.body.classList.remove("drop"));
+addEventListener("drop", e => { e.preventDefault(); document.body.classList.remove("drop"); addFiles(e.dataTransfer.files); });
+load(0);
+</script>
+</body>
+</html>
