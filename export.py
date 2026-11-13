@@ -6,7 +6,9 @@ Each visible top-level folder becomes one moving piece, named after the folder.
 A loose layer becomes its own piece, named after the layer, unless it fills the
 whole canvas: those are flattened together (the backdrop). Folders named in SPLIT are opened up
 instead, and layers inside them are merged by the text before "_"
-(M_white + M_color + M_lineart -> "M").
+(M_white + M_color + M_lineart -> "M"). Folders named in SKIP are left out.
+A piece under a clipped Hue/Saturation layer is colour-matched to the PSD's own
+flattened picture, because psd-tools cannot apply that adjustment in CMYK files.
 The eye icons are respected. --hidden also exports folders whose eye is off
 (handy when you saved with folders hidden while painting); hidden loose layers stay out.
 --watch keeps running and re-exports every time the PSD is saved.
@@ -22,7 +24,8 @@ from psd_tools import PSDImage
 from psd_tools.composite import composite
 
 OUT_W = 1920        # width of the full canvas on the web
-SPLIT = {"letras"}  # folders to open up instead of flattening
+SPLIT = {"todo", "letras"}  # folders to open up instead of flattening
+SKIP = {"a"}                # folders to leave out (here: flattened copies of the whole picture)
 # The PSD is CMYK with no embedded profile; Photoshop shows it through its working
 # CMYK space (SWOP by default). Windows ships a SWOP profile, so use it to match.
 # Colours look off? Point this at the .icc you use, or at a missing path for raw maths.
@@ -38,7 +41,7 @@ def units(layers, split=False):
         for l in layers:
             if l.is_group():
                 l.visible = True  # in memory only, the PSD is never written
-    live = (l for l in layers if l.visible and l.width and l.height)
+    live = (l for l in layers if l.visible and l.width and l.height and l.name.strip() not in SKIP)
     for is_group, run in groupby(live, key=lambda l: l.is_group()):
         run = list(run)
         if is_group:
@@ -74,6 +77,34 @@ def to_rgba(psd, color, alpha):
     return rgb
 
 
+def flat_rgb(psd):
+    """The whole picture as Photoshop flattened it on save, in sRGB."""
+    im = psd.topil()
+    if psd.color_mode.name != "CMYK":
+        return im.convert("RGB")
+    color = 1 - np.asarray(im, np.float32) / 255
+    return to_rgba(psd, color, np.ones(color.shape[:2] + (1,), np.float32)).convert("RGB")
+
+
+def match_colors(img, ref):
+    """Recolour a piece so it looks as it does in the flattened picture `ref` (same size).
+    One 3x4 colour matrix, fitted on the piece's opaque pixels. Wherever something else
+    covers the piece in `ref` the pixels disagree wildly, so the worst 40% are dropped and
+    the fit repeated. ponytail: one matrix per piece; a piece that is mostly covered, or
+    tinted differently in different places, would need a finer model."""
+    a = np.asarray(img, np.float32) / 255
+    solid = a[..., 3] > 0.99
+    x = np.c_[a[solid][:, :3], np.ones(solid.sum(), np.float32)]
+    y = (np.asarray(ref, np.float32) / 255)[solid]
+    keep = np.ones(len(x), bool)
+    for _ in range(4):
+        m = np.linalg.lstsq(x[keep], y[keep], rcond=None)[0]
+        err = np.abs(x @ m - y).sum(1)
+        keep = err <= np.quantile(err, 0.6)
+    a[..., :3] = np.clip(a[..., :3] @ m[:3] + m[3], 0, 1)
+    return Image.fromarray((a * 255).round().astype(np.uint8), "RGBA")
+
+
 HERE = Path(__file__).parent
 
 
@@ -86,15 +117,18 @@ def main(psd_path, *flags, out=HERE / "layers"):
     out = Path(out)
     out.mkdir(exist_ok=True)
     k = OUT_W / psd.width
-    meta = []
+    meta, flat = [], None
     for i, (name, layers) in enumerate(units(psd)):
-        keep = {id(l) for l in layers}
+        nodes = list(layers)  # the piece's layers, everything inside them, and the folders they sit in
         for l in layers:
-            keep |= {id(d) for d in l.descendants()} if l.is_group() else set()
+            nodes += l.descendants() if l.is_group() else []
             p = l.parent
             while p is not None and p is not psd:
-                keep.add(id(p))
+                nodes.append(p)
                 p = p.parent
+        keep = {id(l) for l in nodes}
+        tinted = psd.color_mode.name == "CMYK" and any(
+            c.kind == "huesaturation" and c.visible for l in nodes for c in getattr(l, "clip_layers", []))
         # clip to the canvas
         x0 = max(0, min(l.left for l in layers)); y0 = max(0, min(l.top for l in layers))
         x1 = min(psd.width, max(l.right for l in layers)); y1 = min(psd.height, max(l.bottom for l in layers))
@@ -104,20 +138,21 @@ def main(psd_path, *flags, out=HERE / "layers"):
         # premultiplied resize, otherwise transparent pixels bleed a white fringe
         size = (max(1, round(img.width * k)), max(1, round(img.height * k)))
         img = img.convert("RGBa").resize(size, Image.LANCZOS).convert("RGBA")
+        if tinted:
+            flat = flat or flat_rgb(psd)
+            img = match_colors(img, flat.crop((x0, y0, x1, y1)).resize(size, Image.LANCZOS))
         box = img.getbbox()
         if not box:
             continue
         img = img.crop(box)
-        if not meta:
-            bg = "#%02x%02x%02x" % img.getpixel((0, 0))[:3]  # page colour behind the art
         src = f"{len(meta):02d}.webp"
         img.save(out / src, quality=90, method=6)
         meta.append({"name": name, "src": src, "x": round(x0 * k) + box[0], "y": round(y0 * k) + box[1],
                      "w": img.width, "h": img.height})
-        print(src, name, img.size, flush=True)
+        print(src, name, img.size, "colour-matched" if tinted else "", flush=True)
     for old in set(out.glob("*.webp")) - {out / m["src"] for m in meta}:
         old.unlink()  # pieces that no longer exist
-    doc = {"bg": bg, "w": OUT_W, "h": round(psd.height * k), "layers": meta}
+    doc = {"w": OUT_W, "h": round(psd.height * k), "layers": meta}
     (out / "layers.js").write_text("const ART = " + json.dumps(doc, ensure_ascii=False, indent=1) + ";\n", encoding="utf-8")
 
 
